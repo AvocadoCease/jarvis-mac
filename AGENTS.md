@@ -7,7 +7,9 @@ before changing anything.
 
 - **`app/`** is Jarvis.app, a menu bar app in Swift:
   - Hold fn to dictate into any app; the text is pasted where the cursor is.
-  - Hold Right Option to ask JARVIS; the answer is spoken, with the reactor animation on screen.
+  - Hold Right Option to ask JARVIS, or double-tap it and just talk; the answer is spoken, with the
+    reactor animation on screen. The app uses `/api/ask`, which streams a status and then each sentence
+    as it's written. After an answer the app keeps listening for about 6 seconds for a reply.
   - Speech-to-text is whisper.cpp's `whisper-server` on 127.0.0.1:8178.
 - **`server/serve.py`** is a small HTTP server on **127.0.0.1:8787**, local only. The app sends
   questions there and gets back the answer and its voice.
@@ -16,6 +18,11 @@ before changing anything.
   - It answers with their claude.ai connectors (Calendar, Gmail, Drive, Slack, Jira) and can use
     the Mac: Bash, files and the web.
   - Looking runs straight away. Anything that changes something waits for a spoken "go ahead".
+  - Today's conversation is kept in `~/.config/jarvis-mac/conversation.json` until 4 am, so a fresh
+    Claude process carries on from it. "Start fresh" clears it.
+  - Questions carry what's on screen (app, window title, selected text; never password fields).
+  - With T3 Code, `follow_session` makes JARVIS speak a short summary when that session finishes,
+    fails or needs the person (`server/announce.py`, `/api/follow`).
 - **Three background services** are set up by `install.sh` as LaunchAgents:
   - `com.jarvis-mac.server`
   - `com.jarvis-mac.whisper`

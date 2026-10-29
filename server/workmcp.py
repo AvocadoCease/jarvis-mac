@@ -11,7 +11,9 @@ Tools:
 With --actions it is "jarvis-actions" instead, for JARVIS's brain only (see brain.py):
   start_session(project, message)  start a new T3 session (via the `t3` CLI)
   message_session(session, message) send a message to an existing session
-JARVIS asks the user to say "yes" before either runs; this server doesn't check that itself.
+  follow_session(session)          JARVIS stays with this session: says when it finishes or needs you
+  stop_following()                 ...and stops (starting or messaging a session follows it too)
+JARVIS asks the user to say "yes" before starting or messaging a session; this server doesn't check that itself.
 
 Speaks MCP over stdio (newline-delimited JSON-RPC), no dependencies.
   python3 tools/workmcp.py --test   prints the overview, for checking by hand
@@ -23,11 +25,14 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 import settings
 
 DB = os.path.expanduser("~/.t3/userdata/statev2.sqlite")
+SERVER = f"http://127.0.0.1:{os.environ.get('JARVIS_PORT', '8787')}"   # the JARVIS server (serve.py sets this)
 T = "orchestration_v2_projection_"
 
 STATUS = {"running": "working", "starting": "working", "preparing": "working", "queued": "queued",
@@ -256,6 +261,41 @@ NEW_SESSION_PROVIDER = settings.T3.get("provider", "")
 NEW_SESSION_MODEL = settings.T3.get("model", "")
 
 
+def most_recent_session():
+    """Title of the top-level session with the latest activity (likely the one open in T3)."""
+    with _db() as con:
+        rows = _top_level_threads(con)
+    return rows[0]["title"] if rows else None
+
+
+def _server(path, **params):
+    with urllib.request.urlopen(f"{SERVER}{path}?" + urllib.parse.urlencode(params), timeout=30) as r:
+        return json.load(r)
+
+
+def follow_session(session):
+    with _db() as con:
+        t = _find(con, session)
+        if not t:
+            return {"error": f"No session matching {session!r}. Try search_sessions."}
+        _, status = _state(con, t["thread_id"])
+    _server("/api/follow", thread=t["thread_id"], title=t["title"])
+    return {"following": t["title"], "status": status,
+            "note": "JARVIS now says out loud when this session finishes, fails or needs the user."}
+
+
+def stop_following():
+    return {"stopped": True, "was_following": _server("/api/follow", stop="1").get("was")}
+
+
+def _follow_quietly(thread_id, title):
+    try:
+        _server("/api/follow", thread=thread_id, title=title)
+        return True
+    except OSError:
+        return False
+
+
 def _t3(*args):
     out = subprocess.run([T3_CLI, *args], capture_output=True, text=True, timeout=60)
     if out.returncode != 0:
@@ -298,7 +338,10 @@ def start_session(project, message, title=None):
         info = json.loads(out)
     except ValueError:
         info = {"output": out[:300]}
-    return {"started": True, "project": p["title"], "thread": info}
+    thread = info.get("thread") if isinstance(info.get("thread"), dict) else info
+    thread_id = thread.get("threadId") or thread.get("id")
+    followed = bool(thread_id) and _follow_quietly(thread_id, title or thread.get("title") or message.strip()[:60])
+    return {"started": True, "project": p["title"], "thread": info, "following": followed}
 
 
 def message_session(session, message):
@@ -307,7 +350,8 @@ def message_session(session, message):
     if not t:
         return {"error": f"No session matching {session!r}. Try search_sessions."}
     _t3("thread", "send", t["thread_id"], message.strip())
-    return {"sent": True, "session": t["title"],
+    followed = _follow_quietly(t["thread_id"], t["title"])
+    return {"sent": True, "session": t["title"], "following": followed,
             "note": "A busy session gets it as its next turn; nothing was interrupted."}
 
 
@@ -327,8 +371,16 @@ ACTION_TOOLS = [
                     "it gets the message as its next turn.",
      "inputSchema": {"type": "object", "properties": {"session": {"type": "string"}, "message": {"type": "string"}},
                      "required": ["session", "message"]}},
+    {"name": "follow_session",
+     "description": "Stay with one T3 Code session (found by part of its title): JARVIS then says out loud when it "
+                    "finishes, fails or needs the user, with a short summary of its reply.",
+     "inputSchema": {"type": "object", "properties": {"session": {"type": "string"}}, "required": ["session"]}},
+    {"name": "stop_following",
+     "description": "Stop following the T3 session JARVIS is following.",
+     "inputSchema": {"type": "object", "properties": {}}},
 ]
 ACTION_HANDLERS = {"list_projects": list_projects, "start_session": start_session,
+                   "follow_session": follow_session, "stop_following": stop_following,
                    "message_session": message_session}
 
 TOOLS = [

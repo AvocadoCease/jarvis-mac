@@ -7,8 +7,15 @@ A voice assistant and a dictation app for your Mac, with Claude Code as the brai
 - **Dictate anywhere:** hold **fn** and talk, then let go, and the text is typed into whatever app you're in.
   Double-tap fn for hands-free; tap fn again to finish. Speech-to-text is Whisper running on your
   Mac, so your voice never leaves it.
-- **Ask JARVIS:** hold **Right Option** and ask. It answers out loud in a calm British voice, with a
-  reactor on screen that listens, thinks and speaks with you.
+- **Ask JARVIS:** hold **Right Option** and ask, or double-tap it and just talk. It answers out loud in a
+  calm British voice, with a reactor on screen that listens, thinks and speaks with you.
+- **Talk back and forth:** after an answer it keeps listening for a few seconds, so you can just reply.
+  It starts speaking as soon as the first sentence of its answer is ready, and says what it's doing
+  ("Checking your calendar.") while it looks things up. Say "that's all" to finish.
+- **One conversation all day:** it remembers what you talked about today, so "it" and "that" still
+  work later. Say "start fresh" to clear it.
+- **It knows what's on screen:** the app you're in, its window title and any selected text. Select an
+  error and ask "what does this mean?".
 - **It can look things up:**
   - your calendar, email, Google Drive, Slack and Jira, through the claude.ai connectors you've
     set up
@@ -21,6 +28,8 @@ A voice assistant and a dictation app for your Mac, with Claude Code as the brai
   just stops it talking.
 - **Meeting reminders:** five minutes before each meeting, if Google Calendar is connected. Turn
   them off from the menu bar icon.
+- **Follow a T3 Code session** (if you use T3 Code): say "follow the scraper session". When it finishes,
+  fails or needs you, JARVIS tells you what it said in a sentence or two, then listens for your reply.
 
 There are no API keys to manage: it uses your own Claude Code login.
 
@@ -73,8 +82,10 @@ every time it's rebuilt:
 | Hold **fn**, talk, let go | Dictate into the app you're in |
 | Double-tap **fn**, talk, tap fn | Dictate hands-free |
 | Hold **Right Option**, ask, let go | Ask JARVIS |
+| Double-tap **Right Option**, talk | Ask without holding (it stops when you pause) |
+| Just reply after an answer | Carry on the conversation ("that's all" or **Esc** ends it) |
 | Press **Right Option** while it talks or thinks | Cut in with a new question |
-| **Esc** while it talks | Stop it talking |
+| **Esc** while it talks or listens | Stop it talking or listening |
 | Say **"go ahead"** / **"cancel"** | Answer when it asks "Shall I go ahead?" |
 
 Some things to try:
@@ -84,6 +95,8 @@ Some things to try:
 - "Find the PDF I downloaded yesterday."
 - "Open Spotify."
 - "Book a call with Sam at 10 tomorrow, half an hour."
+- "What does this mean?" (with an error message selected)
+- "Follow the scraper session." (with T3 Code)
 
 If dictation shows a **Copy** popup instead of typing, it couldn't find a text box to type into.
 The text is also saved in the menu bar icon's Recent list.
@@ -108,7 +121,10 @@ Logs are in `~/Library/Logs/jarvis-mac/` and `~/Library/Logs/Dictate/jarvis-app.
 - **English only.** Whisper runs with `-l en`.
 - **Answers take about 2–6 seconds;** dictation is near-instant.
 - **The voice is macOS `say`.** It's clear but a little robotic.
-- **Hold-to-talk only.** There's no "Hey JARVIS" wake word yet.
+- **No "Hey JARVIS" wake word yet.** Hold or double-tap Right Option to start.
+- **You can't talk over it.** Press Right Option to cut in instead.
+- **Keeping listening after answers can pick up a loud TV or radio.** Turn it off from the menu bar icon
+  ("Keep listening after answers").
 
 There's a sibling project for TVs: [jarvis-tv](https://github.com/AvocadoCease/jarvis-tv).
 

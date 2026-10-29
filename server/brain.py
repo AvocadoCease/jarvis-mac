@@ -4,6 +4,8 @@ Runs Claude Code headless (`claude -p`) on your own Claude login, so it uses the
 claude.ai connectors (Google Calendar, Gmail, Drive, Slack, Jira) with no API key.
 
   ask("what's on my calendar tomorrow?", source="mac") -> {"ok", "reply", "seconds"}
+  ask(..., emit=fn)   also streams: fn("say", sentence) as each sentence is written, and
+                      fn("status", "Checking your calendar.") when it starts using a tool
 
 It can also use this Mac (shell, files, the web): looking runs straight away, changing anything
 needs a yes. See COMPUTER_TOOLS.
@@ -15,7 +17,9 @@ answer: "yes" runs exactly that tool call, anything else cancels it (and Claude 
 said, so "make it 11 instead" re-asks with the change). Unanswered after 90 s, it's cancelled.
 
 One Claude process is kept warm (connectors already connected), so answers take ~2-6 s.
-Follow-ups ("and the day after?") work for 5 minutes, then it starts a fresh conversation.
+Follow-ups ("and the day after?") share its conversation for 20 minutes, then it starts a fresh process. The
+day's conversation carries on regardless: every exchange is kept (HISTORY, until 4 am) and a fresh process is
+told what was said earlier. "Start fresh" (see serve.py) clears it.
 If your connectors live on a non-default Claude login, set claude_config_dir in config.json.
 """
 import json
@@ -27,9 +31,10 @@ import shutil
 import subprocess
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import settings
+import workmcp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -40,7 +45,10 @@ EFFORT = "low"            # measured: ~4.8 s a question vs ~6.8 s at default eff
 WORKDIR = os.path.join(ROOT, "brain")
 STATE = os.path.expanduser("~/.config/jarvis-mac/brain.json")
 T3_ON = os.path.isdir(os.path.expanduser("~/.t3"))   # T3 Code installed: JARVIS can report on its sessions
-FOLLOW_UP_SECONDS = 300   # questions within 5 minutes of each other share a conversation
+FOLLOW_UP_SECONDS = 1200  # questions within 20 minutes of each other share one Claude process
+HISTORY = os.path.expanduser("~/.config/jarvis-mac/conversation.json")   # today's exchanges, for continuity
+HISTORY_TURNS = 15        # how many earlier exchanges a fresh process is told about
+DAY_STARTS_AT = 4         # the conversation starts over at 4 am
 CONFIRM_SECONDS = 90      # how long a "shall I?" waits for an answer
 TIMEOUT = 90
 USER_NAME = settings.USER_NAME
@@ -92,7 +100,8 @@ UNUSED_SERVERS = ["claude_ai_Amplitude", "claude_ai_Canva", "claude_ai_Claude_Do
 # Local MCP servers. jarvis-work (read-only, registered with `claude mcp add --scope user`) and
 # jarvis-actions (start/message T3 sessions), which only the brain loads, via --mcp-config.
 LOCAL_TOOLS = ["mcp__jarvis-work__work_overview", "mcp__jarvis-work__session_detail",
-               "mcp__jarvis-work__search_sessions", "mcp__jarvis-actions__list_projects"] if T3_ON else []
+               "mcp__jarvis-work__search_sessions", "mcp__jarvis-actions__list_projects",
+               "mcp__jarvis-actions__follow_session", "mcp__jarvis-actions__stop_following"] if T3_ON else []
 LOCAL_ACTIONS = ["mcp__jarvis-actions__start_session", "mcp__jarvis-actions__message_session"] if T3_ON else []
 MCP_CONFIG = json.dumps({"mcpServers": {"jarvis-actions": {
     "command": PYTHON, "args": ["-I", os.path.join(HERE, "workmcp.py"), "--actions"]}}})
@@ -109,6 +118,15 @@ REQUIRED = {"create_event": ["summary", "startTime", "endTime"], "update_event":
             "start_session": ["project", "message"], "message_session": ["session", "message"]}
 ACTIONS = {f"mcp__claude_ai_{server}__{tool}" for server, tools in ACTION_TOOLS.items() for tool in tools}
 ACTIONS |= set(LOCAL_ACTIONS)
+
+# What JARVIS says while a tool works, instead of a stock "one moment" (first match on the tool name).
+STATUS = [("Google_Calendar", "Checking your calendar."), ("Gmail", "Looking at your email."),
+          ("Slack", "Checking Slack."), ("Atlassian", "Checking Jira."), ("Google_Drive", "Looking in Drive."),
+          ("jarvis-work", "Checking your T3 sessions."), ("start_session", ""), ("message_session", ""),
+          ("follow_session", ""), ("stop_following", ""), ("WebSearch", "Searching the web."),
+          ("WebFetch", "Searching the web."), ("Bash", "Checking the Mac."), ("Read", "Checking the Mac."),
+          ("Glob", "Checking the Mac."), ("Grep", "Checking the Mac.")]
+STATUS_PHRASES = sorted({phrase for _, phrase in STATUS if phrase})
 
 # This Mac. Every call comes to us ("ask" rules below) so _harmless() can decide: looking runs straight
 # away, and anything that changes something needs a yes like any other action.
@@ -137,7 +155,13 @@ T3_NOTES = f"""
 T3 Code sessions (jarvis-work tools): what's running, finished, failed or needs {USER_NAME}, and what each did.
 "What are we working on" means these sessions. When summarising sessions, name each by its topic in a few words, say
 its state, and mention anything that needs {USER_NAME} first. "Needs you" means an approval or question is
-pending; "waiting on a background job" doesn't need them.""" if T3_ON else ""
+pending; "waiting on a background job" doesn't need them.
+
+Following a T3 session: follow_session(session) makes it the session you're with. You then tell {USER_NAME} out loud
+when it finishes, fails or needs them, with a short summary of what it said (that happens by itself), and "it", "the
+session" or "tell it..." mean that session unless they name another. Follow a session when asked ("follow the
+scraper session", "stay with that one"); starting or messaging a session follows it automatically. stop_following
+when asked ("stop following it"). Following needs no yes; messaging the session still does.""" if T3_ON else ""
 
 PERSONA = f"""You are JARVIS, the assistant of {USER_NAME}, who lives in {PLACE}.
 Your reply is spoken aloud by a text-to-speech voice, so:
@@ -246,7 +270,8 @@ def _command(persona=PERSONA, stream=True):
            "--disable-slash-commands", "--settings", SETTINGS,
            "--append-system-prompt", persona]
     if stream:
-        cmd += ["--input-format", "stream-json", "--output-format", "stream-json", "--permission-prompt-tool", "stdio"]
+        cmd += ["--input-format", "stream-json", "--output-format", "stream-json", "--permission-prompt-tool", "stdio",
+                "--include-partial-messages"]   # text as it's written, so the first sentence can be spoken early
     else:
         cmd += ["--output-format", "json", "--permission-prompts", "none"]   # background lookups never act
     return cmd
@@ -269,7 +294,9 @@ class _Worker:
         os.makedirs(WORKDIR, exist_ok=True)
         self.proc = subprocess.Popen(_command(), cwd=WORKDIR, env=_env(), stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
-        self.events = queue.Queue()   # ("result", msg) | ("permission", msg) | ("ended", None)
+        # ("result", msg) | ("permission", msg) | ("ended", None), and while it writes:
+        # ("text", piece) | ("tool", name) | ("block_end", None)
+        self.events = queue.Queue()
         self.said = ""                # Claude's latest text in this turn: the "I'll book..." before an action
         self.busy = False             # a turn is running (see interrupt)
         self.interrupted = False
@@ -291,7 +318,15 @@ class _Worker:
             except ValueError:
                 continue
             kind = msg.get("type")
-            if kind == "assistant":
+            if kind == "stream_event":
+                e = msg.get("event") or {}
+                if e.get("type") == "content_block_delta" and (e.get("delta") or {}).get("type") == "text_delta":
+                    self.events.put(("text", e["delta"].get("text", "")))
+                elif e.get("type") == "content_block_start" and (e.get("content_block") or {}).get("type") == "tool_use":
+                    self.events.put(("tool", e["content_block"].get("name", "")))
+                elif e.get("type") == "content_block_stop":
+                    self.events.put(("block_end", None))
+            elif kind == "assistant":
                 for block in (msg.get("message") or {}).get("content") or []:
                     if block.get("type") == "text" and block.get("text", "").strip():
                         self.said = block["text"]
@@ -518,17 +553,61 @@ def _harmless(tool, a):
     return False   # Write, Edit, WebFetch
 
 
-def _wait(w, source):
+class _Stream:
+    """Turns Claude's text, as it's written, into whole sentences for emit("say", ...)."""
+    SENTENCE = re.compile(r"(.+?[.!?][\"')\u201d]*)(\s+|$)", re.S)
+
+    def __init__(self, emit):
+        self.emit, self.buffer, self.said, self.statuses = emit, "", [], set()
+
+    def text(self, piece):
+        self.buffer += piece
+        while True:   # keep the last sentence back until something follows it: "10." may be "10.30"
+            m = self.SENTENCE.match(self.buffer)
+            if not m or not m.group(2):
+                break
+            self._say(m.group(1))
+            self.buffer = self.buffer[m.end():]
+
+    def flush(self):
+        self._say(self.buffer)
+        self.buffer = ""
+
+    def _say(self, sentence):
+        sentence = re.sub(r"[*_`#>]+", "", sentence).strip()
+        if sentence and self.emit:
+            self.said.append(sentence)
+            self.emit("say", sentence)
+
+    def tool(self, name):
+        phrase = next((p for key, p in STATUS if key in name), "")
+        if phrase and phrase not in self.statuses and self.emit:
+            self.statuses.add(phrase)
+            self.emit("status", phrase)
+
+
+def _wait(w, source, stream=None):
     """Wait for this turn to end, or stop at the first action that needs a yes."""
+    stream = stream or _Stream(None)
     deadline = time.time() + TIMEOUT
     while True:
         try:
             kind, msg = w.wait(max(1, deadline - time.time()))
         except queue.Empty:
             return {"error": "timed out"}
+        if kind == "text":
+            stream.text(msg)
+            continue
+        if kind == "block_end":
+            stream.flush()
+            continue
+        if kind == "tool":
+            stream.tool(msg)
+            continue
         if kind == "ended":
             return {"error": "Claude stopped"}
         if kind == "result":
+            stream.flush()
             return {"result": msg}
         req = msg.get("request") or {}
         tool, tool_input = req.get("tool_name", ""), req.get("input") or {}
@@ -561,7 +640,7 @@ def _wait(w, source):
         return {"confirm": _intent(w.said, details, tool_input.get("description") or ""), "details": details}
 
 
-def _confirm(text):
+def _confirm(text, stream=None):
     """The user's answer to the pending "shall I?"."""
     p, decision = dict(_pending), _decision(text)
     print(f"BRAIN confirm {decision}: {text[:80]!r} for {p['tool']}", flush=True)
@@ -578,7 +657,7 @@ def _confirm(text):
         w.answer(p["request_id"], False, message=f"{USER_NAME} didn't say yes, so it was not done. Instead they said: "
                                                  f"{text!r}. If that changes the details, call the tool again with the "
                                                  "changes. If it's something else, deal with that.")
-    result = _wait(w, p["source"])
+    result = _wait(w, p["source"], stream)
     if decision == "yes" and "result" in result:
         for callback in after_action:
             threading.Thread(target=callback, args=(p["tool"],), daemon=True).start()
@@ -593,21 +672,110 @@ def _expire():
     _wait(p["worker"], p["source"])   # let the turn finish; nobody is listening for it
 
 
-def ask(text, source="mac"):
-    """Answer a question. `source` is where it was asked: "mac", "remote" or "tv"."""
+# ---- the day's conversation ------------------------------------------------------------------------
+
+_history = []   # {"at", "q", "a", "source"}, oldest first
+
+
+def _day_start():
+    now = datetime.now()
+    start = now.replace(hour=DAY_STARTS_AT, minute=0, second=0, microsecond=0)
+    return (start if now >= start else start - timedelta(days=1)).timestamp()
+
+
+def _load_history():
+    try:
+        with open(HISTORY) as f:
+            _history[:] = [h for h in json.load(f) if h.get("at", 0) >= _day_start()]
+    except (OSError, ValueError):
+        _history.clear()
+
+
+def _remember(question, answer, source):
+    """Keep this exchange for the rest of the day."""
+    if not question or not answer:
+        return
+    start = _day_start()
+    _history[:] = [h for h in _history if h["at"] >= start][-60:]
+    _history.append({"at": time.time(), "q": question[:400], "a": answer[:600], "source": source})
+    try:
+        os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
+        with open(HISTORY + ".tmp", "w") as f:
+            json.dump(_history, f)
+        os.replace(HISTORY + ".tmp", HISTORY)
+    except OSError as e:
+        print("BRAIN history not saved:", repr(e)[:120], flush=True)
+
+
+def _earlier_today():
+    """What was said earlier today, for a fresh Claude process: so the conversation carries on."""
+    start = _day_start()
+    rows = [h for h in _history if h["at"] >= start][-HISTORY_TURNS:]
+    if not rows:
+        return ""
+    said = " / ".join(f"{time.strftime('%H:%M', time.localtime(h['at']))} {USER_NAME}: \u201c{h['q'][:200]}\u201d, "
+                      f"you: \u201c{h['a'][:300]}\u201d" for h in rows)
+    return (f" Earlier today you and {USER_NAME} said (oldest first): {said}. That's the same conversation: carry "
+            "on from it (\"it\", \"that\", \"the second one\" may refer back), but don't recap it unless asked.")
+
+
+def forget():
+    """"Start fresh": clear the day's conversation and start a new Claude process."""
+    with _lock:
+        _history.clear()
+        try:
+            os.remove(HISTORY)
+        except OSError:
+            pass
+        _fresh_worker()
+    print("BRAIN conversation cleared", flush=True)
+
+
+def _screen_note(screen):
+    """What's in front of the user (from the Mac app), for "what does this mean?" and "this session"."""
+    if not screen or not screen.get("app"):
+        return ""
+    note = f" On screen: {screen['app']}"
+    if screen.get("window"):
+        note += f", window \u201c{screen['window'][:120]}\u201d"
+    if screen.get("selected"):
+        note += f". Selected text: \u201c{screen['selected'][:1500]}\u201d"
+    if "T3 Code" in screen["app"]:
+        try:
+            recent = workmcp.most_recent_session()
+            if recent:
+                note += f". The T3 session most recently active (probably the one open) is \u201c{recent}\u201d"
+        except Exception:
+            pass
+    return note + (". Use this only when they refer to something on screen (this, that, here, the selected text, "
+                   "this session); otherwise ignore it.")
+
+
+def ask(text, source="mac", emit=None, screen=None):
+    """Answer a question. `source` is where it was asked: "mac", "remote" or "tv".
+
+    With `emit`, the answer is also streamed (see _Stream), and the result's "speak" is only what
+    hasn't been said yet: "" for a streamed answer, or "Shall I go ahead?" after a streamed "I'll...".
+    `screen` ({"app", "window", "selected"}, from the Mac app) says what's in front of the user.
+    """
     text = (text or "").strip()[:500]
     started = time.time()
+    stream = _Stream(emit)
     with _lock:
         if _pending:
             w = _pending["worker"]
             w.interrupted = False
-            result = _confirm(text)
+            result = _confirm(text, stream)
         else:
             w = _worker["w"]
             if w is None or not w.alive():
                 w = _fresh_worker()
             now = time.strftime("%A %d %B %Y, %H:%M", time.localtime())
             note = f" {PRIVATE_NOTE}" if source != "mac" and privacy() else ""
+            if w.turns == 0:   # a fresh process: tell it how the day's conversation has gone
+                note += _earlier_today()
+            if source == "mac":
+                note += _screen_note(screen)
             recent = [t for at, t in _announced if time.time() - at < 900]
             if recent:
                 note += " You recently announced: " + " / ".join(recent[-3:])
@@ -618,25 +786,31 @@ def ask(text, source="mac"):
                     print("BRAIN context error:", repr(e)[:120], flush=True)
             try:
                 w.ask(f"[It is {now} in {PLACE}. Asked from: {source}.{note}]\n{text}")
-                result = _wait(w, source)
+                result = _wait(w, source, stream)
             except (OSError, ValueError) as e:
                 result = {"error": repr(e)}
         seconds = round(time.time() - started, 1)
         if w.interrupted and "confirm" not in result:
             print(f"BRAIN interrupted after {seconds}s: {text[:80]!r}", flush=True)
             return {"ok": True, "reply": "", "interrupted": True, "seconds": seconds}
+        said = " ".join(stream.said)
         if "confirm" in result:
-            return {"ok": True, "reply": result["confirm"], "confirm": True, "details": result["details"],
-                    "seconds": seconds}
+            question = result["confirm"]
+            plan = question.removesuffix(" Shall I go ahead?").strip()
+            speak = "Shall I go ahead?" if plan and plan != question and plan in said else question
+            _remember(text, question, source)
+            return {"ok": True, "reply": question, "confirm": True, "details": result["details"],
+                    "seconds": seconds, "speak": speak}
         msg = result.get("result") or {}
         reply = (msg.get("result") or "").strip()
         if not reply or msg.get("is_error"):
             print("BRAIN error:", result.get("error") or msg.get("subtype"), flush=True)
             _fresh_worker()
-            return {"ok": False, "seconds": seconds,
-                    "reply": f"I'm sorry, {USER_NAME}, I couldn't get an answer just now. Try asking again."}
+            sorry = f"I'm sorry, {USER_NAME}, I couldn't get an answer just now. Try asking again."
+            return {"ok": False, "seconds": seconds, "reply": sorry, "speak": sorry}
         print(f"BRAIN {source} {seconds}s turns={msg.get('num_turns')}: {text[:80]!r} -> {reply[:120]!r}", flush=True)
-        return {"ok": True, "reply": reply, "seconds": seconds}
+        _remember(text, reply, source)
+        return {"ok": True, "reply": reply, "seconds": seconds, "speak": "" if said else reply}
 
 
 def interrupt():
@@ -654,6 +828,39 @@ def interrupt():
     return stopped
 
 
+SUMMARY_PERSONA = (f"You are JARVIS, {USER_NAME}'s voice assistant, reporting on one of their coding agents (a T3 "
+                   "Code session). Given the agent's latest message, say in one or two short plain sentences what it "
+                   "did or found, then what it needs from them, if anything (a question, a decision, an approval). "
+                   "Speak about the agent in the third person (\"It fixed...\", \"It's asking whether...\"). "
+                   "No markdown, file paths, code, IDs or numbers nobody would say aloud.")
+
+
+def summarise(text, timeout=40):
+    """A coding agent's message as one or two spoken sentences, by a small fast model with no tools.
+    Falls back to the message's own first sentences."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    try:
+        out = subprocess.run([CLAUDE, "-p", "--model", "claude-haiku-5-5", "--effort", "low", "--tools", "",
+                              "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands",
+                              "--no-session-persistence", "--settings", '{"disableAllHooks":true}',
+                              "--append-system-prompt", SUMMARY_PERSONA,
+                              "Here is the coding agent's latest message:\n<message>\n" + text[-6000:] + "\n</message>\n"
+                              f"Reply with only your summary for {USER_NAME}, under 30 words: one short sentence on what it "
+                              "did, and one on what it needs from them if anything. Call the agent \"it\". "
+                              "Don't answer or carry out the message."],
+                             cwd=WORKDIR, env=_env(), capture_output=True, text=True, timeout=timeout)
+        summary = out.stdout.strip()
+        if out.returncode == 0 and summary:
+            summary = re.sub(r"^(the )?(coding )?agent\b", "It", re.sub(r"[*_`#>]+", "", summary).strip(), flags=re.I)
+            return " ".join(re.split(r"(?<=[.!?])\s+", summary)[:2])[:300]   # two sentences at most, whatever it wrote
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print("BRAIN summary failed:", repr(e)[:120], flush=True)
+    plain = re.sub(r"```.*?```|[*_`#>]+|\[([^\]]*)\]\([^)]*\)", lambda m: m.group(1) or "", text, flags=re.S)
+    return " ".join(re.split(r"(?<=[.!?])\s+", " ".join(plain.split()))[:2])[:300]
+
+
 def lookup_json(prompt, timeout=150):
     """A one-off background lookup (its own Claude process, never acts). Returns parsed JSON or None."""
     try:
@@ -668,6 +875,9 @@ def lookup_json(prompt, timeout=150):
     except Exception as e:
         print("BRAIN lookup failed:", repr(e)[:200], flush=True)
         return None
+
+
+_load_history()
 
 
 if __name__ == "__main__":
